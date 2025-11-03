@@ -137,6 +137,7 @@
   <ItemGroup>
     <ClInclude Include="FileWriter.h" />
     <ClInclude Include="includes\hermes_core.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="SocketRelay.h" />
     <ClInclude Include="XMemoryRing.hpp" />
   </ItemGroup>
@@ -144,6 +145,9 @@
     <None Include="..\.gitattributes" />
     <None Include="..\.gitignore" />
     <None Include="..\README.md" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="HermesPortalCore.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
