@@ -462,6 +462,8 @@
 //    return 0;
 //}
 
+
+
 /*
 HermesPortal v1.4.1 (core, 7202 + 7208 + SHM via XMemoryRing v2 + Socket single-client IPC)
 - 7 files total (SocketRelay added)
@@ -487,6 +489,7 @@ HermesPortal v1.4.1 (core, 7202 + 7208 + SHM via XMemoryRing v2 + Socket single-
 #include <string>
 #include <algorithm>
 #include <csignal>
+#include <fstream>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -545,6 +548,9 @@ static void signal_handler(int) {
 // Default multicast settings: default instrument = FO -> port 34330
 static std::string MULTICAST_IP = "233.1.2.5";
 static int         MULTICAST_PORT = 34330; // FO default. CM = 34074
+// debug control (defined here; declared extern in the header)
+bool g_cm_debug = false;
+
 
 static std::string to_lowercopy(const std::string& s) {
     std::string out = s;
@@ -591,7 +597,7 @@ int main(int argc, char* argv[]) {
         print_usage_and_exit(argc ? argv[0] : nullptr);
     }
 
-    // CLI parse (first non-flag arg is tokensCsv)
+    // CLI parse
     std::string tokensCsv = argv[1];
     std::set<int> enabledCodes;
     bool marketAll = false;
@@ -609,14 +615,21 @@ int main(int argc, char* argv[]) {
     size_t socket_maxq = 4096;
     size_t socket_batch_bytes = 16 * 1024;
 
-    // Accept multicast-related flags starting from argv[2..]
+    // selected feed (default FO)
+    FeedType selectedFeed = FeedType::FO;
+
+    // optional: dump first UDP packet to file and/or print hex (for debugging CM framing)
+    std::string dump_pkt_path;
+    bool dump_hex = false;
+
+
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
 
-        // support --flag=value as well as --flag value
-        auto eq = a.find('=');
-        std::string key = (eq == std::string::npos) ? a : a.substr(0, eq);
-        std::string val = (eq == std::string::npos) ? std::string() : a.substr(eq + 1);
+        // support --flag=value
+        auto eqpos = a.find('=');
+        std::string key = (eqpos == std::string::npos) ? a : a.substr(0, eqpos);
+        std::string val = (eqpos == std::string::npos) ? std::string() : a.substr(eqpos + 1);
 
         if (key == "--enable") {
             if (val.empty() && i + 1 < argc) val = argv[++i];
@@ -672,15 +685,23 @@ int main(int argc, char* argv[]) {
         else if (key == "--debug-schema") {
             debugSchema = true;
         }
-        // new flags: --inst, --mcast-ip, --mcast-port
+        else if (key == "--dump-pkt") {
+            if (val.empty() && i + 1 < argc) val = argv[++i];
+            dump_pkt_path = val;
+        }
+        else if (key == "--dump-hex") {
+            dump_hex = true;
+        }
         else if (key == "--inst") {
             if (val.empty() && i + 1 < argc) val = argv[++i];
             val = to_lowercopy(val);
             if (val == "cm") {
                 MULTICAST_PORT = 34074;
+                selectedFeed = FeedType::CM;
             }
             else if (val == "fo" || val.empty()) {
                 MULTICAST_PORT = 34330;
+                selectedFeed = FeedType::FO;
             }
             else {
                 std::cerr << "[FATAL] Invalid value for --inst (use 'cm' or 'fo')\n";
@@ -717,12 +738,13 @@ int main(int argc, char* argv[]) {
             }
         }
         else {
-            // Unknown / other flags: ignore here (many are handled above). This keeps compatibility.
+            // ignore unknown args here (keeps compatibility)
         }
     }
 
     // Print chosen multicast settings early so logs show them
-    std::cout << "[INFO] Multicast: " << MULTICAST_IP << ":" << MULTICAST_PORT << " (default inst=fo)\n";
+    std::cout << "[INFO] Multicast: " << MULTICAST_IP << ":" << MULTICAST_PORT
+        << " (feed=" << (selectedFeed == FeedType::CM ? "CM" : "FO") << ")\n";
 
     // LZO init
     if (!Lzo::Init()) {
@@ -850,7 +872,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         uint16_t p = socketRelay->listening_port();
-        // <-- changed from std::cerr to std::cout so parent/spawner doesn't treat this as an error line
         std::cout << "[SOCKET] listening 127.0.0.1:" << p << " (token=" << (socket_auth_token.size() ? socket_auth_token.substr(0, 4) + "..." : "<none>") << ")\n";
 
         // Set external sink to forward to file/shm as well as socket relay:
@@ -893,9 +914,18 @@ int main(int argc, char* argv[]) {
         };
     if (want(7202)) dispatcher.registerHandler(std::make_unique<Handler7202>());
     if (want(7208)) dispatcher.registerHandler(std::make_unique<Handler7208>());
+
+    // Register CM handlers (global implementations in HandlersMarket.cpp)
+    if (selectedFeed == FeedType::CM) {
+        dispatcher.registerHandler(std::make_unique<HandlerCM_CT>());
+        dispatcher.registerHandler(std::make_unique<HandlerCM_PN>());
+    }
+
     if (debugSchema) PrintSchemas();
 
     PacketParser parser(dispatcher);
+    parser.setFeedType(selectedFeed);
+
     InstrumentDirectory instDir;
 
     // Multicast - now configurable via CLI flags above
@@ -947,6 +977,55 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
         int recv_len = recvfrom(sockfd, recv_buf, sizeof(recv_buf), 0, nullptr, nullptr);
         if (recv_len > 0) {
+
+            static bool dumped = false;
+            if (!dumped && (!dump_pkt_path.empty() || dump_hex)) {
+                // write binary file if requested
+                if (!dump_pkt_path.empty()) {
+                    std::ofstream ofs(dump_pkt_path, std::ios::binary);
+                    if (ofs) {
+#ifdef _WIN32
+                        ofs.write(reinterpret_cast<const char*>(recv_buf), recv_len);
+#else
+                        ofs.write(recv_buf, recv_len);
+#endif
+                        ofs.close();
+                        std::cout << "[DUMP] wrote " << recv_len << " bytes to " << dump_pkt_path << "\n";
+                    }
+                    else {
+                        std::cerr << "[DUMP] failed to open " << dump_pkt_path << " for writing\n";
+                    }
+                }
+                // print hex preview if requested
+                if (dump_hex) {
+                    std::ostringstream ss;
+                    ss << "[DUMP HEX] first " << std::min<size_t>(256, static_cast<size_t>(recv_len)) << " bytes:\n";
+                    size_t hex_print = std::min<size_t>(256, static_cast<size_t>(recv_len));
+                    for (size_t ii = 0; ii < hex_print; ++ii) {
+#ifdef _WIN32
+                        unsigned char b = static_cast<unsigned char>(recv_buf[ii]);
+#else
+                        unsigned char b = static_cast<unsigned char>(recv_buf[ii]);
+#endif
+                        ss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+                        if ((ii & 0x0F) == 0x0F) ss << '\n';
+                        else ss << ' ';
+                    }
+                    ss << std::dec << '\n';
+                    std::cout << ss.str();
+                }
+                dumped = true;
+                std::cout << "[DUMP] finished; exiting to allow analysis. Remove --dump-pkt to resume normal operation.\n";
+#ifdef _WIN32
+                closesocket(sockfd);
+                WSACleanup();
+#else
+                close(sockfd);
+#endif
+                return 0;
+            }
+
+
             parser.parse(recv_buf, recv_len, sink, &instDir, strikes);
         }
         else {
