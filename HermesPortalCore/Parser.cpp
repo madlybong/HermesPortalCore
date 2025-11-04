@@ -1,92 +1,23 @@
-//#include "includes/hermes_core.h"
-//
-//static uint16_t peek_code(const char* d, int L, int base) {
-//    if (L < base + 20) return 0;
-//    uint16_t code = 0; std::memcpy(&code, d + base + 10, 2); return ntohs(code);
-//}
-//
-//void PacketParser::parse(const char* buf, int len, ConsoleSink& out,
-//    InstrumentDirectory* instDir, const StrikeList& strikes) {
-//    if (len < 4) return;
-//
-//    uint16_t NOP = 0;
-//    std::memcpy(&NOP, buf + 2, 2);
-//    NOP = ntohs(NOP);
-//    int off = 4;
-//
-//    static thread_local unsigned char dcmp[65536];
-//
-//    for (int i = 0; i < NOP; ++i) {
-//        if (off + 2 > len) break;
-//
-//        uint16_t compLen = 0;
-//        std::memcpy(&compLen, buf + off, 2);
-//        off += 2;
-//        compLen = ntohs(compLen);
-//        if (compLen == 0 || off + compLen > len) { off += compLen; continue; }
-//
-//        const unsigned char* src = reinterpret_cast<const unsigned char*>(buf + off);
-//        off += compLen;
-//
-//        std::size_t outLen = 0;
-//        if (!Lzo::Decompress(src, compLen, dcmp, sizeof(dcmp), outLen)) {
-//            continue;
-//        }
-//        const char* dst = reinterpret_cast<const char*>(dcmp);
-//        int dst_len = static_cast<int>(outLen);
-//
-//        // Try base 0 or 8
-//        int base = -1;
-//        uint16_t code0 = peek_code(dst, dst_len, 0);
-//        uint16_t code8 = peek_code(dst, dst_len, 8);
-//        int code = 0;
-//
-//        if (code0) { base = 0; code = code0; }
-//        if (code8 && (code == 0 || code8 == 7208 || code8 == 7202)) { base = 8; code = code8; }
-//
-//        if (base >= 0 && code != 0) {
-//            MessageView mv{ dst, dst_len };
-//            if (auto* h = disp_.find(static_cast<uint16_t>(code))) {
-//                h->handle(mv, out, instDir, strikes);
-//            }
-//        }
-//    }
-//}
-
-
-
 // Parser.cpp
-// Packet parsing for FO/CM. Includes robust CM concatenated-LZO handling.
-
 #include "includes/hermes_core.h"
-
-#include <cstring>
-#include <sstream>
-#include <iomanip>
 #include <vector>
 #include <fstream>
-#include <algorithm>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <iostream>
 
-extern bool g_cm_debug; // declared in header, defined in HermesPortalCore.cpp
-
-// ---------- helpers ----------
+// existing FO parser (unchanged)
 static uint16_t peek_code(const char* d, int L, int base) {
     if (L < base + 20) return 0;
-    uint16_t code = 0; std::memcpy(&code, d + base + 10, 2); return ntohs(code);
+    uint16_t code = 0;
+    std::memcpy(&code, d + base + 10, 2);
+    return ntohs(code);
 }
 
-static inline uint16_t read_be16(const uint8_t* p) {
-    uint16_t v = 0; std::memcpy(&v, p, 2); return ntohs(v);
-}
-static inline uint32_t read_be32(const uint8_t* p) {
-    uint32_t v = 0; std::memcpy(&v, p, 4); return ntohl(v);
-}
-
-// ---------- original parse (FO-style, decompress per compressed chunk) ----------
 void PacketParser::parse(const char* buf, int len, ConsoleSink& out,
     InstrumentDirectory* instDir, const StrikeList& strikes) {
-
     if (len < 4) return;
 
     uint16_t NOP = 0;
@@ -133,252 +64,242 @@ void PacketParser::parse(const char* buf, int len, ConsoleSink& out,
     }
 }
 
-// ---------- CM parsing: concatenated LZO-aware parser ----------
-// Note: This function expects to be called from HermesPortalCore when feed = CM.
-// Signature uses uint8_t* and size_t to be clear.
+// --------------------------- CM parser ---------------------------
+// CM payloads frequently contain concatenated small LZO streams.
+// This function scans for likely LZO start markers (0x1A 0x04) and
+// attempts to decompress each candidate chunk. Appends successful
+// decompressed outputs into a single buffer which is then parsed
+// as a sequence of ST_INFO_HEADER + payload records.
 void PacketParser::parseCM(const uint8_t* buf, size_t len, ConsoleSink& out,
     InstrumentDirectory* instDir, const StrikeList& strikes) {
 
     if (!buf || len < 5) return;
 
-    size_t pos = 0;
-    uint8_t cCompOrNot = buf[pos]; pos += 1;
-    if (pos + 4 > len) {
-        std::cerr << "[CM parser] truncated batch header\n";
-        return;
-    }
-    uint16_t nDataSize = read_be16(buf + pos); pos += 2;
-    uint16_t iNoOfPackets = read_be16(buf + pos); pos += 2;
+    // ST_COMP_BATCH_HEADER (per spec): CHAR cCompOrNot; SHORT nDataSize; SHORT iNoOfPackets;
+    // total 5 bytes
+    uint8_t cCompOrNot = buf[0];
+    uint16_t nDataSize_be = 0;
+    uint16_t iNoOfPackets_be = 0;
+    std::memcpy(&nDataSize_be, buf + 1, 2);
+    std::memcpy(&iNoOfPackets_be, buf + 3, 2);
+    uint16_t nDataSize = ntohs(nDataSize_be);
+    uint16_t iNoOfPackets = ntohs(iNoOfPackets_be);
 
-    const uint8_t* payload_ptr = buf + pos;
-    size_t payload_len = 0;
-    if (nDataSize > 0) payload_len = std::min<size_t>(nDataSize, (len - pos));
-    else payload_len = len - pos;
+    size_t payload_off = 5;
+    if (payload_off > len) return;
+    size_t payload_len = (nDataSize == 0) ? (len - payload_off) : std::min<size_t>(nDataSize, len - payload_off);
+    const uint8_t* payload_ptr = buf + payload_off;
 
-    // header summary
-    {
-        std::ostringstream dbg;
-        dbg << "[CM parser] batch header cCompOrNot=0x" << std::hex << (int)cCompOrNot << std::dec
+    if (g_cm_debug) {
+        std::ostringstream ss;
+        ss << "[CM parser] batch header cCompOrNot=0x" << std::hex << (int)cCompOrNot << std::dec
             << " nDataSize=" << nDataSize << " iNoOfPackets=" << iNoOfPackets
             << " payload_len=" << payload_len << " preview=";
-        for (size_t i = 0; i < std::min<size_t>(payload_len, 24); ++i)
-            dbg << std::hex << std::setw(2) << std::setfill('0') << (int)payload_ptr[i];
-        dbg << std::dec;
-        std::cerr << dbg.str() << "\n";
+        // preview first 16 bytes
+        size_t pp = std::min<size_t>(16, payload_len);
+        for (size_t i = 0; i < pp; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)payload_ptr[i];
+        }
+        ss << std::dec;
+        std::cerr << ss.str() << "\n";
     }
 
-    if (payload_len == 0) {
-        std::cerr << "[CM parser] empty payload\n";
-        return;
-    }
+    bool is_compressed = !(cCompOrNot == 0 || cCompOrNot == 'N' || cCompOrNot == 'n');
 
-    bool is_uncompressed = (cCompOrNot == 'N' || cCompOrNot == 'n' || cCompOrNot == 0);
-    bool is_compressed = !is_uncompressed;
-
+    // If not compressed, feed the payload directly to the same ST_INFO parser
     if (!is_compressed) {
-        // parse payload directly (unchanged)
-        const uint8_t* p = payload_ptr;
-        size_t rem = payload_len;
-        const size_t INFO_HEADER_SZ = 2 + 2 + 4;
-        const size_t INFO_TRAILER_SZ = 2 + 1;
-        for (uint16_t pkt_idx = 0; pkt_idx < iNoOfPackets; ++pkt_idx) {
-            if (rem < INFO_HEADER_SZ + INFO_TRAILER_SZ) break;
-            uint16_t iCode_be = read_be16(p); p += 2; rem -= 2;
-            uint16_t iLen_be = read_be16(p); p += 2; rem -= 2;
-            uint32_t seqNo_be = read_be32(p); p += 4; rem -= 4;
+        // use the decompressed payload as-is
+        const char* proc = reinterpret_cast<const char*>(payload_ptr);
+        int proc_len = static_cast<int>(payload_len);
 
-            uint16_t iLen = iLen_be;
-            if (iLen < INFO_HEADER_SZ + INFO_TRAILER_SZ) continue;
+        // iterate ST_INFO_HEADER records
+        size_t pos = 0;
+        while (pos + 8 <= static_cast<size_t>(proc_len)) {
+            // ST_INFO_HEADER: SHORT iCode; SHORT iLen; LONG lSeqNo; (big-endian)
+            uint16_t iCode_be = 0, iLen_be = 0;
+            uint32_t lSeqNo_be = 0;
+            std::memcpy(&iCode_be, proc + pos + 0, 2);
+            std::memcpy(&iLen_be, proc + pos + 2, 2);
+            std::memcpy(&lSeqNo_be, proc + pos + 4, 4);
+            uint16_t iCode = ntohs(iCode_be);
+            uint16_t iLen = ntohs(iLen_be);
+            uint32_t lSeqNo = ntohl(lSeqNo_be);
 
-            size_t payload_bytes = static_cast<size_t>(iLen) - INFO_HEADER_SZ - INFO_TRAILER_SZ;
-            if (rem < payload_bytes + INFO_TRAILER_SZ) break;
+            if (iLen < 8) break; // invalid
+            if (pos + iLen > static_cast<size_t>(proc_len)) break;
 
-            const uint8_t* payload = p;
-            p += payload_bytes; rem -= payload_bytes;
-
-            uint16_t recv_checksum = 0; std::memcpy(&recv_checksum, p, 2); recv_checksum = ntohs(recv_checksum); p += 2; rem -= 2;
-            uint8_t cEOT = *p; p += 1; rem -= 1; (void)cEOT;
-
-            if (auto* h = disp_.find(iCode_be)) {
-                MessageView mv{ reinterpret_cast<const char*>(payload), static_cast<int>(payload_bytes) };
+            MessageView mv{ proc + pos, static_cast<int>(iLen) };
+            if (auto* h = disp_.find(iCode)) {
                 h->handle(mv, out, instDir, strikes);
             }
+            pos += iLen;
         }
         return;
     }
 
-    // Compressed: find markers 0x1A 0x04 and try decompressing at the marker with full remaining bytes.
-    // We'll build a full_decomp buffer by appending decompressed sub-blocks.
+    // Compressed path: try to split by likely LZO start markers (0x1A 0x04)
     std::vector<size_t> markers;
-    markers.reserve(256);
     for (size_t i = 0; i + 1 < payload_len; ++i) {
-        if (payload_ptr[i] == 0x1A && payload_ptr[i + 1] == 0x04) markers.push_back(i);
+        if (payload_ptr[i] == 0x1A && payload_ptr[i + 1] == 0x04) {
+            markers.push_back(i);
+        }
     }
+    // If no markers found, try marker at 0 as heuristic
+    if (markers.empty()) markers.push_back(0);
 
-    std::vector<unsigned char> full_decomp;
-    std::vector<unsigned char> workbuf; // temp buffer for LZO output
-    full_decomp.reserve(payload_len * 4);
+    // We'll try to decompress each chunk between markers (marker..next_marker or marker..end)
+    std::vector<unsigned char> decomp_all;
+    decomp_all.reserve(payload_len * 4); // guess expansion
 
-    auto dump_payload_for_analysis = [&](const uint8_t* data, size_t len, const char* path = "cm_failed_payload.bin") {
-        std::ofstream ofs(path, std::ios::binary);
-        if (ofs) {
-            ofs.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
-            ofs.close();
-            std::cerr << "[CM DUMP] wrote " << len << " bytes to " << path << "\n";
+    // per-chunk buffer (thread-local)
+    static thread_local std::vector<unsigned char> workbuf;
+    workbuf.resize(65536); // initial
+
+    bool any_ok = false;
+
+    for (size_t mi = 0; mi < markers.size(); ++mi) {
+        size_t start = markers[mi];
+        size_t end = (mi + 1 < markers.size()) ? markers[mi + 1] : payload_len;
+        if (start >= payload_len) continue;
+        if (end <= start) continue;
+
+        size_t comp_len = end - start;
+        const unsigned char* comp_ptr = payload_ptr + start;
+
+        // try decompress comp_ptr[0..comp_len)
+        std::size_t outLen = 0;
+        bool ok = false;
+
+        // ensure workbuf large enough
+        if (workbuf.size() < payload_len * 4) workbuf.resize(std::max<size_t>(workbuf.size(), payload_len * 4));
+
+        if (g_cm_debug) {
+            std::cerr << "[CM] trying marker-chunk at offset=" << start << " len=" << comp_len << "\n";
         }
-        else {
-            std::cerr << "[CM DUMP] failed to write " << path << "\n";
-        }
-        // print hex preview (first 256 bytes)
-        size_t hp = std::min<size_t>(256, len);
-        std::ostringstream ss;
-        ss << "[CM DUMP HEX] first " << hp << " bytes:\n";
-        for (size_t i = 0; i < hp; ++i) {
-            ss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
-            if ((i & 0x0F) == 0x0F) ss << '\n';
-            else ss << ' ';
-        }
-        ss << std::dec << '\n';
-        std::cerr << ss.str();
-        };
 
-    auto try_decompress_slice = [&](const uint8_t* payload_ptr_inner, size_t payload_len_inner,
-        size_t off, size_t avail,
-        std::vector<unsigned char>& workbuf_inner,
-        std::vector<unsigned char>& dest,
-        size_t& outLen) -> bool {
-            if (off >= payload_len_inner || avail == 0) return false;
-            const uint8_t* start = payload_ptr_inner + off;
-            size_t want = std::max<size_t>(64 * 1024, avail * 8);
-            if (want > (8ull << 20)) want = (8ull << 20);
-            if (workbuf_inner.size() < want) workbuf_inner.resize(want);
-
-            if (g_cm_debug) {
-                std::ostringstream ss;
-                ss << "[CM-TRY] off=" << off << " avail=" << avail << " cap=" << workbuf_inner.size() << " pv=";
-                size_t pv = std::min<size_t>(16, avail);
-                for (size_t i = 0; i < pv; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int)start[i];
-                ss << std::dec;
-                std::cerr << ss.str() << "\n";
-            }
-
-            size_t tmpOut = 0;
-            bool ok = Lzo::Decompress(start, static_cast<std::size_t>(avail),
-                workbuf_inner.data(), workbuf_inner.size(), tmpOut);
-            if (!ok) {
-                if (g_cm_debug) std::cerr << "[CM-TRY] decompress failed at off=" << off << " avail=" << avail << "\n";
-                return false;
-            }
-            dest.insert(dest.end(), workbuf_inner.data(), workbuf_inner.data() + tmpOut);
-            outLen = tmpOut;
-            if (g_cm_debug) std::cerr << "[CM-TRY] decompress OK off=" << off << " out=" << tmpOut << "\n";
-            return true;
-        };
-
-    bool any_success = false;
-
-    if (!markers.empty()) {
-        // Try decompressing at each marker using the full remaining payload from that marker.
-        for (size_t mi = 0; mi < markers.size(); ++mi) {
-            size_t marker_pos = markers[mi];
-            size_t off = marker_pos;
-            size_t avail = (off < payload_len) ? (payload_len - off) : 0;
-            if (avail == 0) continue;
-
-            size_t outLen = 0;
-            if (try_decompress_slice(payload_ptr, payload_len, off, avail, workbuf, full_decomp, outLen)) {
-                any_success = true;
-                if (g_cm_debug) std::cerr << "[CM parser] decompressed at marker " << marker_pos << " out=" << outLen << "\n";
-                // continue trying next markers; append-only semantics
+        if (Lzo::Decompress(comp_ptr, comp_len, workbuf.data(), workbuf.size(), outLen)) {
+            if (outLen > 0) {
+                // success
+                decomp_all.insert(decomp_all.end(), workbuf.data(), workbuf.data() + outLen);
+                any_ok = true;
+                ok = true;
+                if (g_cm_debug) std::cerr << "[CM] decompressed chunk at " << start << " -> " << outLen << " bytes\n";
+                // continue to next chunk
                 continue;
             }
-            else {
-                if (g_cm_debug) std::cerr << "[CM parser] decompress failed at marker " << marker_pos << "; trying small adj window\n";
-                // small adjacency fallback: try marker-1, marker+1
-                for (int delta = -1; delta <= 1; ++delta) {
-                    long o = static_cast<long>(marker_pos) + delta;
-                    if (o < 0 || static_cast<size_t>(o) >= payload_len) continue;
-                    size_t off2 = static_cast<size_t>(o);
-                    size_t avail2 = payload_len - off2;
-                    size_t out2 = 0;
-                    if (try_decompress_slice(payload_ptr, payload_len, off2, avail2, workbuf, full_decomp, out2)) {
-                        any_success = true;
-                        if (g_cm_debug) std::cerr << "[CM parser] decompressed at marker_adj " << off2 << " out=" << out2 << "\n";
-                        break;
-                    }
+        }
+
+        // fallback: try decompressing from start to end-of-payload (in case comp block goes beyond
+        // next marker or markers are noisy)
+        size_t fallback_len = payload_len - start;
+        std::size_t outLen2 = 0;
+        if (fallback_len > comp_len) {
+            if (g_cm_debug) std::cerr << "[CM] fallback: trying full-suffix at " << start << " len=" << fallback_len << "\n";
+            if (Lzo::Decompress(comp_ptr, fallback_len, workbuf.data(), workbuf.size(), outLen2)) {
+                if (outLen2 > 0) {
+                    decomp_all.insert(decomp_all.end(), workbuf.data(), workbuf.data() + outLen2);
+                    any_ok = true;
+                    ok = true;
+                    if (g_cm_debug) std::cerr << "[CM] decompressed suffix at " << start << " -> " << outLen2 << " bytes\n";
+                    // we can't reliably tell consumed compressed bytes; assume remainder consumed and break
+                    break;
                 }
             }
         }
-    }
-    else {
-        // No markers found: conservative fallback scan across first 0..min(256,payload_len-3)
-        size_t max_probe = (payload_len > 3) ? std::min<size_t>(256, payload_len - 3) : 0;
-        for (size_t off = 0; off <= max_probe; ++off) {
-            size_t avail = payload_len - off;
-            size_t outLen = 0;
-            if (try_decompress_slice(payload_ptr, payload_len, off, avail, workbuf, full_decomp, outLen)) {
-                any_success = true;
-                // Keep scanning — there may be more blocks.
-            }
+
+        if (!ok && g_cm_debug) {
+            std::cerr << "[CM] chunk at " << start << " failed to decompress\n";
+            // continue to next marker
         }
     }
 
-    if (!any_success) {
-        std::cerr << "[CM parser] decompression failed — dumping payload for analysis\n";
-        dump_payload_for_analysis(payload_ptr, payload_len);
+    // If nothing worked, try one more attempt: decompress entire payload
+    if (!any_ok) {
+        std::size_t outLen3 = 0;
+        if (g_cm_debug) std::cerr << "[CM] final attempt: decompress entire payload len=" << payload_len << "\n";
+        if (Lzo::Decompress(payload_ptr, payload_len, workbuf.data(), workbuf.size(), outLen3) && outLen3 > 0) {
+            decomp_all.insert(decomp_all.end(), workbuf.data(), workbuf.data() + outLen3);
+            any_ok = true;
+            if (g_cm_debug) std::cerr << "[CM] decompressed entire payload -> " << outLen3 << " bytes\n";
+        }
+    }
+
+    if (!any_ok) {
+        std::cerr << "[CM parser] decompression failed \xC3\xB9 dumping payload\n"; // 'ù' from your logs; keep similar
+        // dump file for offline analysis
+        try {
+            std::ofstream ofs("cm_failed_payload.bin", std::ios::binary);
+            if (ofs) {
+                ofs.write(reinterpret_cast<const char*>(payload_ptr), static_cast<std::streamsize>(payload_len));
+                ofs.close();
+                std::cerr << "[CM DUMP] wrote " << payload_len << " bytes to cm_failed_payload.bin\n";
+            }
+        }
+        catch (...) {}
+        // print a small hex preview
+        if (g_cm_debug) {
+            std::ostringstream ss;
+            ss << "[CM DUMP HEX] first " << std::min<size_t>(256, payload_len) << " bytes:\n";
+            size_t hex_print = std::min<size_t>(256, payload_len);
+            for (size_t i = 0; i < hex_print; ++i) {
+                ss << std::hex << std::setw(2) << std::setfill('0') << (int)payload_ptr[i] << ' ';
+                if ((i & 0x0F) == 0x0F) ss << '\n';
+            }
+            ss << std::dec << '\n';
+            std::cerr << ss.str();
+        }
         return;
     }
 
-    if (g_cm_debug) std::cerr << "[CM parser] concat decompressed -> " << full_decomp.size() << " bytes\n";
+    // Now parse the accumulated decompressed buffer as sequence of ST_INFO_HEADER + payload
+    const unsigned char* proc_ptr = decomp_all.data();
+    size_t proc_len = decomp_all.size();
+    if (g_cm_debug) std::cerr << "[CM parser] concat decompressed -> " << proc_len << " bytes\n";
 
-    // Parse the decompressed buffer into info packets
-    const uint8_t* process_buf = full_decomp.data();
-    size_t process_len = full_decomp.size();
+    size_t pos = 0;
+    while (pos + 8 <= proc_len) {
+        // ST_INFO_HEADER: SHORT iCode; SHORT iLen; LONG lSeqNo;
+        uint16_t iCode_be = 0, iLen_be = 0;
+        uint32_t lSeqNo_be = 0;
+        std::memcpy(&iCode_be, proc_ptr + pos + 0, 2);
+        std::memcpy(&iLen_be, proc_ptr + pos + 2, 2);
+        std::memcpy(&lSeqNo_be, proc_ptr + pos + 4, 4);
+        uint16_t iCode = ntohs(iCode_be);
+        uint16_t iLen = ntohs(iLen_be);
+        uint32_t lSeqNo = ntohl(lSeqNo_be);
 
-    const uint8_t* p = process_buf;
-    size_t rem = process_len;
-    const size_t INFO_HEADER_SZ = 2 + 2 + 4; // iCode + iLen + seq
-    const size_t INFO_TRAILER_SZ = 2 + 1;    // checksum + EOT
-
-    for (uint16_t pkt_idx = 0; pkt_idx < iNoOfPackets; ++pkt_idx) {
-        if (rem < INFO_HEADER_SZ + INFO_TRAILER_SZ) {
-            if (g_cm_debug) std::cerr << "[CM parser] not enough bytes for packet header/trailer (pkt " << pkt_idx << ", rem=" << rem << ")\n";
-            break;
-        }
-        uint16_t iCode_be = read_be16(p); p += 2; rem -= 2;
-        uint16_t iLen_be = read_be16(p); p += 2; rem -= 2;
-        uint32_t seqNo_be = read_be32(p); p += 4; rem -= 4;
-
-        uint16_t iLen = iLen_be;
-        if (iLen < INFO_HEADER_SZ + INFO_TRAILER_SZ) {
-            if (g_cm_debug) std::cerr << "[CM parser] malformed iLen: " << iLen << "\n";
-            continue;
-        }
-
-        size_t payload_bytes = static_cast<size_t>(iLen) - INFO_HEADER_SZ - INFO_TRAILER_SZ;
-        if (rem < payload_bytes + INFO_TRAILER_SZ) {
-            std::cerr << "[CM parser] truncated packet payload (need " << payload_bytes + INFO_TRAILER_SZ
-                << ", have " << rem << ")\n";
+        if (iLen < 8) { // invalid header - abort
+            if (g_cm_debug) std::cerr << "[CM parser] invalid iLen=" << iLen << " at pos=" << pos << "\n";
             break;
         }
 
-        const uint8_t* payload = p;
-        p += payload_bytes; rem -= payload_bytes;
+        // iLen refers to the total packet length (header + payload). Some vendors include trailer; be defensive:
+        size_t rec_total = static_cast<size_t>(iLen);
+        if (pos + rec_total > proc_len) {
+            // if it doesn't fit, try to be tolerant: if remaining bytes look like a header + trailer skip
+            if (g_cm_debug) std::cerr << "[CM parser] incomplete record (need " << rec_total << " have " << (proc_len - pos) << ") at pos=" << pos << "\n";
+            break;
+        }
 
-        uint16_t recv_checksum = 0; std::memcpy(&recv_checksum, p, 2); recv_checksum = ntohs(recv_checksum); p += 2; rem -= 2;
-        uint8_t cEOT = *p; p += 1; rem -= 1; (void)cEOT;
-
-        if (auto* h = disp_.find(iCode_be)) {
-            MessageView mv{ reinterpret_cast<const char*>(payload), static_cast<int>(payload_bytes) };
+        // dispatch: construct MessageView with pointer to header start (so handlers can detect offsets themselves)
+        MessageView mv{ reinterpret_cast<const char*>(proc_ptr + pos), static_cast<int>(rec_total) };
+        if (auto* h = disp_.find(iCode)) {
             h->handle(mv, out, instDir, strikes);
         }
         else {
             if (g_cm_debug) {
-                std::ostringstream oss;
-                oss << "[CM parser] unhandled iCode=0x" << std::hex << std::setw(4) << std::setfill('0') << iCode_be << std::dec
-                    << " seq=" << seqNo_be << " payload_bytes=" << payload_bytes;
-                std::cerr << oss.str() << "\n";
+                // print iCode as two ascii chars as well — helpful for CM (CT/PN etc)
+                char c1 = static_cast<char>((iCode >> 8) & 0xFF);
+                char c2 = static_cast<char>(iCode & 0xFF);
+                std::ostringstream ss;
+                ss << "[CM parser] no handler for iCode=0x" << std::hex << iCode << std::dec
+                    << " (" << c1 << c2 << ") len=" << rec_total << " seq=" << lSeqNo << "\n";
+                std::cerr << ss.str();
             }
         }
-    } // per-packet loop
+
+        pos += rec_total;
+    }
+
+    // done
 }
